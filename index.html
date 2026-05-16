@@ -603,6 +603,57 @@ main {
   tab-size: 2;
 }
 
+/* ---------- File list (multi-file results) ---------- */
+
+.file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-block-end: var(--s-5);
+}
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-height: 36px;
+  padding: var(--s-2) var(--s-3) var(--s-2) var(--s-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 13px;
+  cursor: pointer;
+  max-width: 100%;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+.file-chip:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.file-chip.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent-edge);
+  color: var(--accent);
+  font-weight: 600;
+}
+.file-chip.is-error {
+  border-color: rgba(248, 113, 113, 0.35);
+  color: var(--danger);
+}
+.file-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.file-chip-status {
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.file-chip.is-active .file-chip-status { color: var(--accent); }
+.file-chip.is-error .file-chip-status { color: var(--danger); }
+
 /* ---------- Motion ---------- */
 
 @media (prefers-reduced-motion: reduce) {
@@ -633,16 +684,16 @@ main {
         class="drop-zone"
         role="button"
         tabindex="0"
-        aria-label="Drop a PDF file here or press Enter to choose one"
+        aria-label="Drop one or more PDF files here or press Enter to choose"
       >
         <svg class="drop-icon" viewBox="0 0 56 56" fill="none" aria-hidden="true">
           <rect x="10" y="6" width="36" height="44" rx="3" stroke="currentColor" stroke-width="2"/>
           <path d="M28 18v18m0 0l-7-7m7 7l7-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
-        <div class="drop-title">Drop a PDF here</div>
-        <div class="drop-sub">or click to choose</div>
-        <span class="drop-cta" aria-hidden="true">Choose PDF</span>
-        <input type="file" id="file-input" accept="application/pdf,.pdf" hidden>
+        <div class="drop-title">Drop PDFs here</div>
+        <div class="drop-sub">single file or batch, click to choose</div>
+        <span class="drop-cta" aria-hidden="true">Choose PDFs</span>
+        <input type="file" id="file-input" accept="application/pdf,.pdf" multiple hidden>
       </div>
 
       <details class="settings" id="settings">
@@ -716,8 +767,11 @@ main {
         <div class="results-actions">
           <button type="button" class="btn-secondary" id="copy-btn">Copy markdown</button>
           <button type="button" class="btn-primary" id="download-btn">Download .md</button>
+          <button type="button" class="btn-primary" id="download-zip-btn" hidden>Download all (.zip)</button>
         </div>
       </div>
+
+      <div class="file-list" id="file-list" role="tablist" aria-label="Converted files" hidden></div>
 
       <div class="stats" id="stats" aria-label="Conversion statistics"></div>
 
@@ -808,8 +862,8 @@ main {
     var state = {
       pdfjsReady: false,
       pdfjsFallbackMode: false,
-      currentFile: null,
-      lastResult: null,
+      results: [],       // array of { fileName, markdown, stats, warnings, error }
+      activeIndex: 0,
       aborted: false,
       converting: false
     };
@@ -828,6 +882,9 @@ main {
       results: document.getElementById("results"),
       copyBtn: document.getElementById("copy-btn"),
       downloadBtn: document.getElementById("download-btn"),
+      downloadZipBtn: document.getElementById("download-zip-btn"),
+      resultsTitle: document.getElementById("results-title"),
+      fileList: document.getElementById("file-list"),
       preview: document.getElementById("preview"),
       rawMd: document.getElementById("raw-md"),
       stats: document.getElementById("stats"),
@@ -968,53 +1025,109 @@ main {
     // ----- Conversion orchestration -----
     function openFilePicker() { el.fileInput.click(); }
 
-    function handleFile(file) {
-      if (!file) return;
-      if (file.type && file.type !== "application/pdf" && !/\.pdf$/i.test(file.name || "")) {
-        showError("That file does not look like a PDF. Drop a .pdf file or pick one with the button.");
+    function handleFiles(fileList) {
+      if (!fileList || !fileList.length) return;
+      // Coerce FileList / array to a plain array of accepted PDFs.
+      var files = [];
+      for (var i = 0; i < fileList.length; i++) {
+        var f = fileList[i];
+        if (!f) continue;
+        if (f.type && f.type !== "application/pdf" && !/\.pdf$/i.test(f.name || "")) continue;
+        files.push(f);
+      }
+      if (!files.length) {
+        showError("None of the dropped files look like PDFs.");
         return;
       }
       clearError();
-      state.currentFile = file;
       state.aborted = false;
       if (!state.pdfjsReady && !initPdfJs()) return;
-      runConversion(file);
+      runConversionBatch(files);
     }
 
-    async function runConversion(file) {
+    // Backwards-compat: single-file paths still call handleFile somewhere.
+    function handleFile(file) { handleFiles([file]); }
+
+    async function runConversionBatch(files) {
       if (state.converting) return;
       state.converting = true;
+      state.results = [];
+      state.activeIndex = 0;
       el.results.classList.remove("is-active");
       el.warnings.hidden = true;
       el.warnings.innerHTML = "";
-      setProgress(2, "Reading file", "0%");
-      try {
-        var buf = await file.arrayBuffer();
-        if (state.aborted) throw new Error("Cancelled");
-        setProgress(6, "Parsing PDF", "0%");
-        var options = readOptions();
-        var result = await convertPdfToMarkdown(buf, options, function (pct, page, total) {
+      setProgress(0, "Preparing", "0%");
+
+      var options = readOptions();
+      var total = files.length;
+
+      for (var i = 0; i < files.length; i++) {
+        if (state.aborted) break;
+        var file = files[i];
+        var fileLabel = (total > 1 ? "File " + (i + 1) + " of " + total + ": " : "") + (file.name || "document.pdf");
+        var entry = {
+          fileName: dedupeName(state.results, (file.name || "document").replace(/\.pdf$/i, "") + ".md"),
+          markdown: "",
+          stats: null,
+          warnings: [],
+          error: null
+        };
+        try {
+          setProgress(((i * 100) / total) + 1, fileLabel + " - reading", percentString(i, 0, total));
+          var buf = await file.arrayBuffer();
           if (state.aborted) throw new Error("Cancelled");
-          var label = "Page " + page + " of " + total;
-          setProgress(8 + pct * 0.9, label, Math.round(pct) + "%");
-        });
-        if (state.aborted) throw new Error("Cancelled");
-        setProgress(100, "Done", "100%");
-        result.fileName = (file.name || "document").replace(/\.pdf$/i, "") + ".md";
-        state.lastResult = result;
-        showResult(result);
-      } catch (e) {
-        if (e && e.message === "Cancelled") {
-          showError("Conversion cancelled.");
-        } else {
-          debug("conversion error", e);
-          showError("Conversion failed: " + (e && e.message ? e.message : String(e)));
+          setProgress(((i * 100) / total) + 3, fileLabel + " - parsing", percentString(i, 0, total));
+          var result = await convertPdfToMarkdown(buf, options, function (pct, page, pages) {
+            if (state.aborted) throw new Error("Cancelled");
+            var overall = ((i * 100) + pct) / total;
+            setProgress(overall, fileLabel + " - page " + page + " of " + pages, Math.round(overall) + "%");
+          });
+          if (state.aborted) throw new Error("Cancelled");
+          entry.markdown = result.markdown;
+          entry.stats = result.stats;
+          entry.warnings = result.warnings || [];
+        } catch (e) {
+          if (e && e.message === "Cancelled") {
+            entry.error = "Cancelled";
+          } else {
+            debug("conversion error for " + file.name, e);
+            entry.error = e && e.message ? e.message : String(e);
+          }
         }
-      } finally {
-        state.converting = false;
-        await sleep(150);
-        hideProgress();
+        state.results.push(entry);
+        // Progressively show results so the user can review file 1 while
+        // file 2+ are still being processed.
+        renderResults();
       }
+
+      state.converting = false;
+      if (state.aborted) {
+        // Surface that the batch was interrupted without nuking partial results.
+        if (state.results.length) {
+          showWarning("Batch cancelled after " + state.results.length + " of " + total + " files.");
+        } else {
+          showError("Conversion cancelled.");
+        }
+      } else {
+        setProgress(100, "Done", "100%");
+      }
+      await sleep(150);
+      hideProgress();
+    }
+
+    function percentString(fileIdx, pct, total) {
+      var overall = ((fileIdx * 100) + (pct || 0)) / total;
+      return Math.round(overall) + "%";
+    }
+
+    function dedupeName(existing, name) {
+      var used = {};
+      for (var i = 0; i < existing.length; i++) used[existing[i].fileName] = true;
+      if (!used[name]) return name;
+      var base = name.replace(/\.md$/i, "");
+      var n = 2;
+      while (used[base + "-" + n + ".md"]) n++;
+      return base + "-" + n + ".md";
     }
 
     function readOptions() {
@@ -2158,17 +2271,114 @@ main {
     // ============================================================
     // UI wiring
     // ============================================================
-    function showResult(result) {
+    function activeResult() {
+      return state.results[state.activeIndex] || null;
+    }
+
+    function renderResults() {
       el.results.classList.add("is-active");
-      el.rawMd.value = result.markdown;
-      el.preview.innerHTML = renderMarkdownToHtml(result.markdown);
-      renderStats(result.stats);
-      renderWarnings(result.warnings);
-      el.copyBtn.disabled = false;
-      el.downloadBtn.disabled = false;
+      var n = state.results.length;
+      el.resultsTitle.textContent =
+        n === 0 ? "Conversion complete" :
+        n === 1 ? "Conversion complete" :
+                  n + " files converted";
+      // File chips: hidden for single file, shown otherwise.
+      if (n > 1) {
+        el.fileList.hidden = false;
+        renderFileChips();
+        el.downloadZipBtn.hidden = false;
+      } else {
+        el.fileList.hidden = true;
+        el.fileList.innerHTML = "";
+        el.downloadZipBtn.hidden = true;
+      }
+      // Clamp active index in case results shrunk.
+      if (state.activeIndex >= n) state.activeIndex = Math.max(0, n - 1);
+      renderActive();
+    }
+
+    function renderFileChips() {
+      var html = "";
+      for (var i = 0; i < state.results.length; i++) {
+        var r = state.results[i];
+        var cls = "file-chip";
+        if (i === state.activeIndex) cls += " is-active";
+        if (r.error) cls += " is-error";
+        var status = r.error
+          ? "error"
+          : (r.stats ? r.stats.pages + "p" : "");
+        html += '<button type="button" role="tab" aria-selected="' + (i === state.activeIndex) +
+                '" class="' + cls + '" data-idx="' + i + '">' +
+                '<span class="file-chip-name">' + escapeHtml(r.fileName.replace(/\.md$/i, "")) + '</span>' +
+                (status ? '<span class="file-chip-status">' + escapeHtml(status) + '</span>' : '') +
+                '</button>';
+      }
+      el.fileList.innerHTML = html;
+      // Wire clicks via delegation.
+      var chips = el.fileList.querySelectorAll(".file-chip");
+      for (var c = 0; c < chips.length; c++) {
+        chips[c].addEventListener("click", function (e) {
+          var idx = parseInt(this.getAttribute("data-idx"), 10);
+          if (!isNaN(idx)) {
+            state.activeIndex = idx;
+            renderFileChips();
+            renderActive();
+          }
+        });
+      }
+    }
+
+    function renderActive() {
+      var r = activeResult();
+      if (!r) {
+        el.preview.innerHTML = "";
+        el.rawMd.value = "";
+        el.stats.innerHTML = "";
+        el.copyBtn.disabled = true;
+        el.downloadBtn.disabled = true;
+        return;
+      }
+      if (r.error) {
+        el.preview.innerHTML = '<p style="color: var(--danger);"><strong>Conversion failed:</strong> ' + escapeHtml(r.error) + '</p>';
+        el.rawMd.value = "Conversion failed: " + r.error;
+        el.stats.innerHTML = "";
+        el.copyBtn.disabled = true;
+        el.downloadBtn.disabled = true;
+      } else {
+        el.rawMd.value = r.markdown;
+        el.preview.innerHTML = renderMarkdownToHtml(r.markdown);
+        renderStats(r.stats);
+        el.copyBtn.disabled = false;
+        el.downloadBtn.disabled = false;
+      }
+      renderAllWarnings();
+    }
+
+    function renderAllWarnings() {
+      // Aggregate warnings across all converted files, prefixed by filename
+      // when batch size > 1.
+      var lines = [];
+      for (var i = 0; i < state.results.length; i++) {
+        var r = state.results[i];
+        if (!r.warnings || !r.warnings.length) continue;
+        for (var j = 0; j < r.warnings.length; j++) {
+          var prefix = state.results.length > 1 ? "[" + r.fileName + "] " : "";
+          lines.push(prefix + r.warnings[j]);
+        }
+      }
+      if (!lines.length) {
+        // Keep the warnings div visible only if init-time showWarning already populated it.
+        return;
+      }
+      var html = "<strong>" + lines.length + " warning" + (lines.length === 1 ? "" : "s") + ":</strong><ul>";
+      for (var k = 0; k < lines.length; k++) html += "<li>" + escapeHtml(lines[k]) + "</li>";
+      html += "</ul>";
+      el.warnings.innerHTML = html;
+      el.warnings.hidden = false;
     }
 
     function renderStats(s) {
+      if (!s) { el.stats.innerHTML = ""; return; }
       var rows = [
         ["Pages", s.pages],
         ["Characters", s.chars],
@@ -2185,14 +2395,6 @@ main {
       }
       el.stats.innerHTML = html;
     }
-    function renderWarnings(ws) {
-      if (!ws || !ws.length) { el.warnings.hidden = true; el.warnings.innerHTML = ""; return; }
-      var html = "<strong>" + ws.length + " warning" + (ws.length === 1 ? "" : "s") + ":</strong><ul>";
-      for (var i = 0; i < ws.length; i++) html += "<li>" + escapeHtml(ws[i]) + "</li>";
-      html += "</ul>";
-      el.warnings.innerHTML = html;
-      el.warnings.hidden = false;
-    }
 
     function switchTab(which) {
       var isPreview = which === "preview";
@@ -2206,29 +2408,156 @@ main {
       el.panelRaw.hidden = isPreview;
     }
 
-    function downloadMd() {
-      if (!state.lastResult) return;
-      var blob = new Blob([state.lastResult.markdown], { type: "text/markdown;charset=utf-8" });
+    function triggerBlobDownload(blob, filename) {
       var url = URL.createObjectURL(blob);
       var a = document.createElement("a");
       a.href = url;
-      a.download = state.lastResult.fileName || "document.md";
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
     }
+
+    function downloadMd() {
+      var r = activeResult();
+      if (!r || r.error) return;
+      var blob = new Blob([r.markdown], { type: "text/markdown;charset=utf-8" });
+      triggerBlobDownload(blob, r.fileName || "document.md");
+    }
+
+    function downloadZip() {
+      // Bundle every successfully converted file into a single ZIP.
+      var entries = [];
+      for (var i = 0; i < state.results.length; i++) {
+        var r = state.results[i];
+        if (r.error) continue;
+        entries.push({ name: r.fileName, content: r.markdown });
+      }
+      if (!entries.length) {
+        showError("Nothing to bundle: every file failed to convert.");
+        return;
+      }
+      var blob = makeZip(entries);
+      var stamp = new Date().toISOString().slice(0, 10);
+      triggerBlobDownload(blob, "pdf-to-md-" + stamp + ".zip");
+    }
+
     async function copyMd() {
-      if (!state.lastResult) return;
-      var text = state.lastResult.markdown;
+      var r = activeResult();
+      if (!r || r.error) return;
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(r.markdown);
         el.copyBtn.textContent = "Copied";
         setTimeout(function () { el.copyBtn.textContent = "Copy markdown"; }, 1500);
       } catch (e) {
         el.rawMd.select();
         try { document.execCommand("copy"); } catch (ee) {}
       }
+    }
+
+    // ============================================================
+    // Minimal STORED-format ZIP writer (no compression).
+    // Self-contained: CRC-32 table + local file headers + central
+    // directory + end-of-central-directory record. Produces a Blob.
+    // Spec: PKWARE APPNOTE.TXT, sections 4.3.7 (local), 4.3.12 (central),
+    // 4.3.16 (EOCD). Encodes filenames in UTF-8 (flag bit 11 set).
+    // ============================================================
+    var CRC_TABLE = (function () {
+      var t = new Uint32Array(256);
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        t[n] = c;
+      }
+      return t;
+    })();
+    function crc32(buf) {
+      var c = 0xFFFFFFFF;
+      for (var i = 0; i < buf.length; i++) c = (c >>> 8) ^ CRC_TABLE[(c ^ buf[i]) & 0xFF];
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    }
+    function dosTime(d) {
+      return ((d.getHours() & 0x1F) << 11) | ((d.getMinutes() & 0x3F) << 5) | ((d.getSeconds() / 2) & 0x1F);
+    }
+    function dosDate(d) {
+      return (((d.getFullYear() - 1980) & 0x7F) << 9) | (((d.getMonth() + 1) & 0x0F) << 5) | (d.getDate() & 0x1F);
+    }
+    function makeZip(entries) {
+      var enc = new TextEncoder();
+      var now = new Date();
+      var dTime = dosTime(now);
+      var dDate = dosDate(now);
+      var pieces = [];
+      var central = [];
+      var offset = 0;
+      for (var i = 0; i < entries.length; i++) {
+        var nameBytes = enc.encode(entries[i].name);
+        var data = typeof entries[i].content === "string" ? enc.encode(entries[i].content) : entries[i].content;
+        var crc = crc32(data);
+        var size = data.length;
+
+        var lh = new Uint8Array(30 + nameBytes.length);
+        var dv = new DataView(lh.buffer);
+        dv.setUint32(0, 0x04034b50, true);
+        dv.setUint16(4, 20, true);          // version needed
+        dv.setUint16(6, 0x0800, true);      // flags: bit 11 = UTF-8 filename
+        dv.setUint16(8, 0, true);           // compression: stored
+        dv.setUint16(10, dTime, true);
+        dv.setUint16(12, dDate, true);
+        dv.setUint32(14, crc, true);
+        dv.setUint32(18, size, true);       // compressed size
+        dv.setUint32(22, size, true);       // uncompressed size
+        dv.setUint16(26, nameBytes.length, true);
+        dv.setUint16(28, 0, true);          // extra length
+        lh.set(nameBytes, 30);
+
+        pieces.push(lh, data);
+        central.push({ name: nameBytes, crc: crc, size: size, offset: offset, dTime: dTime, dDate: dDate });
+        offset += lh.length + data.length;
+      }
+
+      var cdStart = offset;
+      for (var j = 0; j < central.length; j++) {
+        var e = central[j];
+        var cd = new Uint8Array(46 + e.name.length);
+        var dvc = new DataView(cd.buffer);
+        dvc.setUint32(0, 0x02014b50, true);
+        dvc.setUint16(4, 20, true);         // version made by
+        dvc.setUint16(6, 20, true);         // version needed
+        dvc.setUint16(8, 0x0800, true);
+        dvc.setUint16(10, 0, true);
+        dvc.setUint16(12, e.dTime, true);
+        dvc.setUint16(14, e.dDate, true);
+        dvc.setUint32(16, e.crc, true);
+        dvc.setUint32(20, e.size, true);
+        dvc.setUint32(24, e.size, true);
+        dvc.setUint16(28, e.name.length, true);
+        dvc.setUint16(30, 0, true);
+        dvc.setUint16(32, 0, true);
+        dvc.setUint16(34, 0, true);
+        dvc.setUint16(36, 0, true);
+        dvc.setUint32(38, 0, true);
+        dvc.setUint32(42, e.offset, true);
+        cd.set(e.name, 46);
+        pieces.push(cd);
+        offset += cd.length;
+      }
+      var cdSize = offset - cdStart;
+
+      var eocd = new Uint8Array(22);
+      var dve = new DataView(eocd.buffer);
+      dve.setUint32(0, 0x06054b50, true);
+      dve.setUint16(4, 0, true);
+      dve.setUint16(6, 0, true);
+      dve.setUint16(8, central.length, true);
+      dve.setUint16(10, central.length, true);
+      dve.setUint32(12, cdSize, true);
+      dve.setUint32(16, cdStart, true);
+      dve.setUint16(20, 0, true);
+      pieces.push(eocd);
+
+      return new Blob(pieces, { type: "application/zip" });
     }
 
     // ----- Event wiring -----
@@ -2238,8 +2567,7 @@ main {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openFilePicker(); }
       });
       el.fileInput.addEventListener("change", function (e) {
-        var f = e.target.files && e.target.files[0];
-        if (f) handleFile(f);
+        if (e.target.files && e.target.files.length) handleFiles(e.target.files);
         e.target.value = "";
       });
       var dragCounter = 0;
@@ -2252,7 +2580,7 @@ main {
         el.dropZone.classList.remove("is-dragging");
         var dt = e.dataTransfer;
         if (!dt || !dt.files || !dt.files.length) return;
-        handleFile(dt.files[0]);
+        handleFiles(dt.files);
       });
       window.addEventListener("dragover", function (e) { e.preventDefault(); });
       window.addEventListener("drop", function (e) { e.preventDefault(); });
@@ -2262,6 +2590,7 @@ main {
       el.tabRaw.addEventListener("click", function () { switchTab("raw"); });
       el.copyBtn.addEventListener("click", copyMd);
       el.downloadBtn.addEventListener("click", downloadMd);
+      el.downloadZipBtn.addEventListener("click", downloadZip);
     }
 
     // ----- Boot -----
